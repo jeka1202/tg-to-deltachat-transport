@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Telegram <-> Delta Chat bridge (multi-contact MVP).
+Telegram <-> Delta Chat bridge (multi-contact MVP, no fake emails).
 
-- Authenticates Telegram account via Telethon.
-- Configures Delta Chat mailbox via deltachat-rpc-client.
-- Mirrors Telegram private chats into dedicated Delta Chat chats.
-- Routes Delta Chat replies back to the correct Telegram contact.
+Concept:
+- One real Delta Chat dialog with your own/операторским email (DC_OPERATOR_EMAIL).
+- Telegram incoming private messages are forwarded into that dialog with bridge IDs.
+- To send back to Telegram from Delta Chat use command:
+  /to tg-<telegram_user_id> <message>
 
 Delta Chat encryption (Autocrypt/OpenPGP) is handled by Delta Chat core.
 """
@@ -21,7 +22,6 @@ from typing import Dict, Optional
 
 from deltachat_rpc_client import DeltaChat
 from telethon import TelegramClient, events
-from telethon.tl.custom.message import Message as TgMessage
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -34,7 +34,6 @@ def ask_value(prompt: str, env_key: str, default: Optional[str] = None, secret: 
     env_value = os.getenv(env_key)
     if env_value:
         return env_value
-
     suffix = f" [{default}]" if default else ""
     while True:
         value = getpass(f"{prompt}{suffix}: ").strip() if secret else input(f"{prompt}{suffix}: ").strip()
@@ -59,6 +58,7 @@ class Settings:
     dc_smtp_port: int
     dc_smtp_security: str
     dc_accounts_dir: str
+    dc_operator_email: str
 
     @classmethod
     def from_env_or_prompt(cls) -> "Settings":
@@ -76,6 +76,7 @@ class Settings:
             dc_smtp_port=int(ask_value("SMTP port", "DC_SMTP_PORT", default="465")),
             dc_smtp_security=ask_value("SMTP security (ssl/starttls/plain)", "DC_SMTP_SECURITY", default="ssl"),
             dc_accounts_dir=ask_value("Папка данных Delta Chat", "DC_ACCOUNTS_DIR", default="./dc-accounts"),
+            dc_operator_email=ask_value("Ваш реальный email в Delta Chat (куда слать Telegram сообщения)", "DC_OPERATOR_EMAIL"),
         )
 
 
@@ -85,11 +86,9 @@ class TgDcBridge:
         self.tg = TelegramClient(settings.tg_session, settings.tg_api_id, settings.tg_api_hash)
         self.dc = DeltaChat(settings.dc_accounts_dir)
         self._dc_account = None
+        self._dc_operator_chat_id: Optional[int] = None
         self._last_dc_msg_id = 0
-
-        # mappings: TG user id <-> Delta Chat chat id
-        self.tg_to_dc_chat: Dict[int, int] = {}
-        self.dc_chat_to_tg: Dict[int, int] = {}
+        self.tg_users: Dict[int, str] = {}
 
     async def setup_telegram(self) -> None:
         log.info("Connecting Telegram...")
@@ -108,59 +107,46 @@ class TgDcBridge:
         account.set_config("send_server", self.settings.dc_smtp_host)
         account.set_config("send_port", str(self.settings.dc_smtp_port))
         account.set_config("send_security", self.settings.dc_smtp_security)
-
         account.configure()
+
         while account.get_config("configured") != "1":
             await asyncio.sleep(1)
 
         self._dc_account = account
-        log.info("Delta Chat configured and ready.")
+        contact_id = account.create_contact(self.settings.dc_operator_email, self.settings.dc_operator_email)
+        self._dc_operator_chat_id = account.create_chat_by_contact_id(contact_id)
+        log.info("Delta Chat configured. Operator chat id: %s", self._dc_operator_chat_id)
 
     async def bootstrap_private_chats(self) -> None:
-        """Preload Telegram private chats and assign bridge IDs."""
         count = 0
         async for dialog in self.tg.iter_dialogs():
             if not dialog.is_user:
                 continue
             user = dialog.entity
-            tg_user_id = int(user.id)
-            await self.ensure_bridge_chat_for_tg_user(tg_user_id)
+            uid = int(user.id)
+            name = (getattr(user, "first_name", "") or "").strip() or (getattr(user, "username", "") or f"user-{uid}")
+            self.tg_users[uid] = name
             count += 1
-        log.info("Bootstrapped %s Telegram private chats.", count)
-
-    async def ensure_bridge_chat_for_tg_user(self, tg_user_id: int) -> int:
-        existing = self.tg_to_dc_chat.get(tg_user_id)
-        if existing:
-            return existing
-
-        user = await self.tg.get_entity(tg_user_id)
-        display = getattr(user, "first_name", "") or getattr(user, "username", "") or str(tg_user_id)
-        bridge_id = f"tg-{tg_user_id}"
-        pseudo_email = f"{bridge_id}@telegram.local"
-        dc_name = f"TG {bridge_id} {display}".strip()
-
-        contact_id = self._dc_account.create_contact(pseudo_email, dc_name)
-        dc_chat_id = self._dc_account.create_chat_by_contact_id(contact_id)
-
-        self.tg_to_dc_chat[tg_user_id] = dc_chat_id
-        self.dc_chat_to_tg[dc_chat_id] = tg_user_id
-        log.info("Mapped Telegram user %s -> Delta chat %s (%s)", tg_user_id, dc_chat_id, bridge_id)
-        return dc_chat_id
+        log.info("Bootstrapped %s Telegram private contacts.", count)
 
     async def relay_tg_to_dc(self) -> None:
         @self.tg.on(events.NewMessage(incoming=True))
         async def handler(event: events.NewMessage.Event) -> None:
-            msg: TgMessage = event.message
-            if not msg.message or not event.is_private:
+            if not event.is_private:
+                return
+            text = (event.raw_text or "").strip()
+            if not text:
                 return
             sender = await event.get_sender()
-            tg_user_id = int(sender.id)
-            dc_chat_id = await self.ensure_bridge_chat_for_tg_user(tg_user_id)
-            text = f"[TG:{tg_user_id}] {msg.message}"
-            self._dc_account.send_text_msg(dc_chat_id, text)
-            log.info("Relayed TG -> DC (%s): %s", tg_user_id, msg.message)
+            uid = int(sender.id)
+            uname = self.tg_users.get(uid) or (getattr(sender, "first_name", "") or getattr(sender, "username", "") or str(uid))
+            self.tg_users[uid] = uname
+            msg = f"[tg-{uid} | {uname}] {text}"
+            self._dc_account.send_text_msg(self._dc_operator_chat_id, msg)
+            log.info("Relayed TG -> DC: %s", msg)
 
     async def relay_dc_to_tg_loop(self) -> None:
+        help_text = "Используйте: /to tg-<id> <сообщение>. Пример: /to tg-123456 Привет"
         while True:
             try:
                 for mid in self._dc_account.get_fresh_msgs():
@@ -168,16 +154,28 @@ class TgDcBridge:
                         continue
                     self._last_dc_msg_id = max(self._last_dc_msg_id, mid)
                     m = self._dc_account.get_msg(mid)
-                    if not m.text:
-                        continue
-                    tg_user_id = self.dc_chat_to_tg.get(m.chat_id)
-                    if tg_user_id is None:
+                    if m.chat_id != self._dc_operator_chat_id or not m.text:
                         continue
                     text = m.text.strip()
-                    if text.startswith("[TG:"):
+                    if text.startswith("[tg-"):
                         continue
-                    await self.tg.send_message(tg_user_id, text)
-                    log.info("Relayed DC -> TG (%s): %s", tg_user_id, text)
+                    if not text.startswith("/to "):
+                        self._dc_account.send_text_msg(self._dc_operator_chat_id, help_text)
+                        continue
+
+                    parts = text.split(maxsplit=2)
+                    if len(parts) < 3 or not parts[1].startswith("tg-"):
+                        self._dc_account.send_text_msg(self._dc_operator_chat_id, help_text)
+                        continue
+
+                    try:
+                        tg_user_id = int(parts[1][3:])
+                    except ValueError:
+                        self._dc_account.send_text_msg(self._dc_operator_chat_id, help_text)
+                        continue
+
+                    await self.tg.send_message(tg_user_id, parts[2])
+                    log.info("Relayed DC -> TG (%s): %s", tg_user_id, parts[2])
             except Exception:
                 log.exception("Error in DC -> TG loop")
             await asyncio.sleep(1)
@@ -187,8 +185,7 @@ class TgDcBridge:
         await self.setup_deltachat()
         await self.bootstrap_private_chats()
         await self.relay_tg_to_dc()
-
-        log.info("Bridge is running (multi-contact mode).")
+        log.info("Bridge is running (single real DC chat + tg-id routing).")
         await asyncio.gather(self.tg.run_until_disconnected(), self.relay_dc_to_tg_loop())
 
 
