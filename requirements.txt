@@ -1,0 +1,2 @@
+telethon==1.41.1
+deltachat-rpc-client==1.156.2
